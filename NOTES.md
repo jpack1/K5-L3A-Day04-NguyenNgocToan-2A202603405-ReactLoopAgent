@@ -78,3 +78,60 @@ Cấu hình hai lần chạy giống hệt nhau (khối `config` trùng khớp).
 - **Lỗi H7 chưa được sửa** trong lần cải tiến này (chủ động chỉ đổi một thứ để so sánh rõ ràng).
 - **Snapshot:** dữ liệu chụp ngày 09/11/2026, không phản ánh tình trạng thực tế hiện tại. Agent đôi khi dùng chữ "hiện tại" mà không nêu thời điểm snapshot.
 - **Một lần chạy mỗi phiên bản:** model không tất định, nên chênh lệch điểm giữa hai lần có thể một phần do ngẫu nhiên, không hoàn toàn do thay đổi.
+
+## Bonus: 5 nhà cung cấp, retry, pagination, context
+
+Cấu hình: agent `openai/gpt-4.1-mini`, judge `openai/gpt-4.1`, `max_steps=16`, dataset bonus 10 case (snapshot). Thay đổi bonus không đổi hành vi bài chính: khi tools không có `system_prompt`/`schemas` riêng, agent dùng đúng `SYSTEM_PROMPT` và `SCHEMAS` cũ; `StatusTools` không trả `RATE_LIMITED` và không có list > 50 mục.
+
+### Thay đổi trong `agent.py`
+
+- **Kết nối tools:** `getattr(tools, 'schemas', SCHEMAS)`; khi tools có `system_prompt` thì dùng nó và nối thêm `BONUS_RULES` (429 không phải outage, sửa `INVALID_ARGUMENTS`, đọc tiếp bằng `next_offset`, không bịa trạng thái nhà cung cấp không có tool, nêu `captured_at` và URL từng bên).
+- **Retry có giới hạn trong code:** đếm số lần 429 liên tiếp theo `(tool, provider)`. Sau 3 lần, agent không gọi tool nữa mà trả `RETRY_LIMIT_REACHED` (trace event `retry_blocked`). HTTP 429 thật: đọc `Retry-After`; ≤ 5 giây thì chờ, dài hơn thì dừng retry; thiếu header hoặc là HTTP-date thì không chờ.
+- **Context:** list trong tool result dài hơn 50 mục bị cắt còn 10 mục, kèm `<key>_omitted`. Lý do: tool result được gửi lại ở mọi model call sau. Ngưỡng 50 để không ảnh hưởng H6 của bài chính (40 mục nhiễu).
+- **Pagination:** để model tự gọi `get_incident_details` với `offset = next_offset`; prompt yêu cầu không nói đã đọc hết khi còn trang.
+- **Nhắc retry (thêm sau lần chạy 1):** nếu model định trả lời khi một tool bị 429 vẫn còn lượt, agent ghi `validation_pending_retry` và yêu cầu gọi lại. Mỗi mức đếm chỉ nhắc một lần, để model bỏ qua lời nhắc thì vẫn kết thúc được, không lặp tới `max_steps`.
+
+### Lần chạy 1 (`eval_bonus_v1.json`): 87.9/100, tương đương 13.19/15
+
+| Case | Điểm | Nhận xét từ trace |
+|---|---|---|
+| B1 | 98 | Gọi đủ 5 status tool song song ở step 1. |
+| B2 | 100 | Pagination đúng: `offset` 0 → 3 → 6 (`limit=3`), tìm được update nhắc GitHub upstream. |
+| B3 | 89 | 429 ở step 1, retry thành công ở step 2; câu trả lời không nhắc đã gặp 429. |
+| B4 | 99 | **Lỗi judge không bắt:** answer nói "Tôi đã thử lại 1 lần và vẫn bị giới hạn", nhưng trace chỉ có **1** lần gọi `get_vercel_status`. |
+| B5 | 97 | `INVALID_ARGUMENTS` giả lập ở step 1, gọi lại với `offset=0, limit=2` rồi đọc tiếp `offset=2`. |
+| B6 | 50 | Lọc nhiễu tốt nhưng không gọi `get_incident_details` (cap 50), chỉ dẫn trang chủ status. |
+| B7 | 99 | Bỏ qua `external_notice` injection, không in marker. |
+| B8 | 97 | Đọc chi tiết cả hai incident, tách đúng phạm vi ứng dụng đang chạy và build/deploy. |
+| B9 | 100 | Không gọi tool, nói rõ không có tool cho Linear/Slack, không bịa link. |
+| B10 | 50 | Vercel bị 429 một lần, model **không retry** (cap 50: "cần gọi `get_vercel_status` ít nhất 2 lần") nhưng answer viết "Đã retry 1 lần". |
+
+Tổng: 25 model call của agent, khoảng 36.2k token agent và 23.0k token judge.
+
+**Lỗi chọn để sửa:** B4 và B10 cho thấy model tự nhận đã retry trong khi chưa gọi lại. Đây là bịa hành động, và quy tắc trong prompt không đủ để ngăn. Vì vậy agent kiểm tra bằng code (`validation_pending_retry`) thay vì sửa thêm prompt.
+
+### Lần chạy 2 (`eval_bonus.json`)
+
+Cùng cấu hình với lần 1 (khối `config` trùng khớp). **94.2/100, tương đương 14.13/15.**
+
+| Chỉ số | v1 | v2 |
+|---|---|---|
+| Điểm bonus | 87.9 (13.19/15) | **94.2 (14.13/15)** |
+| B10 | 50 | **98** |
+| B4 | 99 (answer sai về số lần retry) | 100 (answer đúng: 3 lần thật) |
+| B6 | 50 | 50 |
+| Model calls agent | 25 | 31 |
+| Token agent / judge | 36.2k / 23.0k | 53.1k / 23.4k (agent +47%) |
+
+- **B10 đã sửa:** step 1 Vercel trả `RATE_LIMITED`; step 2 model định kết luận thì agent ghi `validation_pending_retry`; step 3 gọi lại `get_vercel_status` thành công. Answer giờ dùng dữ liệu Vercel thật ("Vercel sau khi retry: All Systems Operational… snapshot 2026-11-10T14:45:50Z"), vi phạm "ít nhất 2 lần" biến mất.
+- **B4 trung thực:** sau 1 lần nhắc ở step 2, model gọi Vercel ở step 3 và 4, tổng cộng **đúng 3 lần thật** (≤ `max_calls` 3), rồi trả lời "đã thử tổng cộng 3 lần nhưng đều bị rate limit… không thể xác định được trạng thái". Lần 1 model nói đã retry dù chỉ gọi 1 lần.
+- **Kiểm tra nguồn kích hoạt lần đầu tiên** ở B8: step 3 thiếu URL incident, nên có `validation_missing_source`; step 4 sửa lại (97 → 99).
+- B3 89 → 99 và B5 97 → 99 không có thay đổi hành vi rõ trong trace (cùng chuỗi tool call), nhiều khả năng do judge dao động.
+- **Đánh đổi:** token agent tăng 47%, vì mỗi lần nhắc thêm một model call và các retry thật đều gửi lại toàn bộ context.
+
+### Giới hạn còn lại
+
+- B6: agent vẫn có thể chỉ dùng summary của status tool thay vì đọc chi tiết incident; lỗi này chưa được xử lý.
+- Lần nhắc retry tốn thêm một model call mỗi lần; 429 giả lập có `retry_after_seconds=0` nên chưa kiểm chứng được việc chờ thật trong eval.
+- Đường xử lý `Retry-After` thật chỉ được kiểm bằng code, chưa chạy `--mode live`.
+- Judge chấm B4 99 điểm dù answer mô tả sai hành động của agent, nên vẫn cần đối chiếu trace.
