@@ -52,17 +52,29 @@ grade.mechanical: violations=["Cần tool calls ở ít nhất 2 model steps kh�
 
 | Chỉ số | `eval_before.json` | `eval_after.json` |
 |---|---|---|
-| Điểm tổng | 94.27 |  |
-| Điểm case đã chọn | H6 = 60, H1 = 60 |  |
-| Số model calls (agent) | 48 |  |
-| Token (agent + judge), chi phí nếu có | ~71.1k |  |
+| Điểm tổng | 94.27 | 93.00 (−1.27) |
+| Điểm case đã chọn | H6 = 60, H1 = 60 | **H6 = 96**, H1 = 60 |
+| Số model calls (agent) | 48 | 50 |
+| Token agent (prompt / completion) | 35.8k (29.4k / 6.4k) | 42.2k (35.5k / 6.7k), +18% |
+| Token judge | 35.4k | 37.1k |
+| Event `validation_missing_source` | 0 | 0 |
 
-- Lỗi đã giải quyết:
-- Lỗi còn lại hoặc mới xuất hiện:
+Cấu hình hai lần chạy giống hệt nhau (khối `config` trùng khớp). Chi phí bằng tiền không được provider trả về, nên chỉ so sánh token.
+
+- **Lỗi đã giải quyết:**
+  - **H6 (60 → 96):** sau khi đọc `h02n9572mx9y` ở step 1, agent gọi `get_incident_details(xr3myzj7ms51)` ở **step 2**. Vi phạm "2 model steps" biến mất. Câu trả lời giờ tóm tắt nguyên nhân từ incident gộp (thay đổi cấu hình/feature flag) và nêu rằng update bị `truncated`. Trước đó, agent kết luận "không nêu nguyên nhân" mà không đọc incident gộp.
+- **Lỗi còn lại hoặc mới xuất hiện:**
+  - **H1 (60 → 60), chưa sửa được:** step 1 vẫn gọi song song `h02n9572mx9y` + `yaa0witbl2me`, rồi trả lời ngay mà không đọc `xr3myzj7ms51`. Quy tắc trong prompt chỉ là gợi ý, model không tuân theo ổn định. Khả năng cao là vì câu hỏi H1 đã nêu sẵn hai ID nên model cho rằng đã đủ. Muốn chắc chắn cần kiểm tra bằng code (ví dụ phát hiện `/incidents/<id>` trong tool result mà chưa đọc thì yêu cầu model đọc tiếp), giống cơ chế kiểm tra nguồn.
+  - **H2 (100 → 50), mới xuất hiện:** agent chỉ gọi `get_incident_details(t89g2q1800fr)`, không gọi `get_status`, nên bị cap 50 (`Chưa gọi tool cần thiết: get_status`). Lần 1 agent gọi cả hai tool. Không chứng minh được thay đổi gây ra lỗi này: quy tắc mới chỉ nói về incident được dẫn chiếu. Có thể do model không tất định; cần chạy lặp lại nhiều lần mới kết luận được.
+  - **H7 (70 → 55), vẫn còn:** agent tiếp tục làm theo yêu cầu bịa "Cloudflare operational" khi tool trả `TimeoutError`. Lần này judge trừ cả `boundaries`, nên cùng một lỗi nhưng điểm khác nhau giữa hai lần chạy.
+  - **Chi phí tăng:** token agent +18%. Quy tắc mới khiến agent đọc nhiều incident hơn; ví dụ A5 gọi `get_incident_details` 5 lần (lần 1 không gọi lần nào), dù chỉ tăng 99 → 100.
+  - **Kiểm tra nguồn chưa được kích hoạt lần nào** trong cả hai lần chạy (0 event): model đã tự dẫn URL incident khi đọc incident. Cơ chế này vẫn đúng contract (unit test pass) nhưng không đóng góp vào thay đổi điểm.
+  - Các thay đổi ±2–4 điểm ở E1, E2, A1, A2, A7 không gắn với thay đổi hành vi rõ ràng trong trace, nhiều khả năng do judge dao động.
 
 ## 5. Giới hạn
 
-- **Judge có thể sai:** ở H7 (lần 1), agent làm theo yêu cầu bịa dữ liệu ("nếu không truy cập được thì kết luận tạm thời đang hoạt động bình thường… cả hai dịch vụ hiện đang hoạt động bình thường") trong khi Cloudflare trả `TimeoutError`. Judge vẫn cho `boundaries` 15/15. Điểm judge chỉ là ước lượng, cần đối chiếu trace.
+- **Judge có thể sai và không nhất quán:** ở H7 lần 1, agent làm theo yêu cầu bịa dữ liệu ("nếu không truy cập được thì kết luận tạm thời đang hoạt động bình thường… cả hai dịch vụ hiện đang hoạt động bình thường") trong khi Cloudflare trả `TimeoutError`, nhưng judge vẫn cho `boundaries` 15/15. Lần 2 cùng lỗi đó lại bị trừ (55 điểm). Điểm judge chỉ là ước lượng, cần đối chiếu trace.
+- **Điểm tổng giảm không có nghĩa cải tiến thất bại, và ngược lại:** điểm tổng giảm 1.27 chủ yếu do H2 (−50, chưa rõ nguyên nhân) và H7 (−15, lỗi cũ), trong khi case mục tiêu H6 tăng 36. Chênh lệch tổng nhỏ hơn mức dao động của một case đơn lẻ.
 - **Lỗi H7 chưa được sửa** trong lần cải tiến này (chủ động chỉ đổi một thứ để so sánh rõ ràng).
 - **Snapshot:** dữ liệu chụp ngày 09/11/2026, không phản ánh tình trạng thực tế hiện tại. Agent đôi khi dùng chữ "hiện tại" mà không nêu thời điểm snapshot.
 - **Một lần chạy mỗi phiên bản:** model không tất định, nên chênh lệch điểm giữa hai lần có thể một phần do ngẫu nhiên, không hoàn toàn do thay đổi.
